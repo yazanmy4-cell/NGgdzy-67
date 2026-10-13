@@ -1,0 +1,6 @@
+flask
+schedule
+pycryptodome
+requests
+urllib3
+protobuf
