@@ -3,7 +3,7 @@ import os
 import time
 import threading
 import schedule
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 
 from like import (
@@ -13,16 +13,43 @@ from like import (
 
 app = Flask(__name__)
 
+VIP_FILE = "vip.json"
+
 STATE = {
     "working": [],
     "last_refresh": None,
     "last_autolike": {},
     "autolike_jobs": {},
+    "autolike_history": {},
     "lock": threading.Lock()
 }
 
 REFRESH_INTERVAL_HOURS = 6
 AUTOLIKE_HOUR = 4
+
+
+def load_vip():
+    if not os.path.exists(VIP_FILE):
+        return {}
+    try:
+        with open(VIP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            return {}
+    except Exception as e:
+        print(f"[vip] load error: {e}")
+        return {}
+
+
+def save_vip():
+    try:
+        with STATE["lock"]:
+            data = json.loads(json.dumps(STATE["autolike_jobs"]))
+        with open(VIP_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[vip] save error: {e}")
 
 
 def refresh_all_accounts():
@@ -45,42 +72,110 @@ def job_refresh_loop():
         refresh_all_accounts()
 
 
-def run_autolike_for(uid, dys):
+def run_autolike_for(uid):
     with STATE["lock"]:
         working = list(STATE["working"])
 
     if not working:
-        print("[autolike] no tokens for " + str(uid))
+        print(f"[autolike] {uid} -> no working accounts")
         return
 
-    limit = max(1, min(dys, len(working)))
-    selected = working[:limit]
-    jwts = [w["jwt"] for w in selected if w.get("jwt")]
+    jwts = [w["jwt"] for w in working if w.get("jwt")]
 
     if not jwts:
-        print("[autolike] no jwt for " + str(uid))
+        print(f"[autolike] {uid} -> no valid JWT")
         return
 
-    print("[autolike] " + str(uid) + " tokens=" + str(len(jwts)))
-    send_likes_once(uid, jwts)
+    print(f"[autolike] {uid} -> using {len(jwts)} accounts")
+
+    added = 0
+    before = 0
+    after = 0
+    sent = 0
+
+    try:
+        nick, before, after, sent = send_likes_once(uid, jwts)
+        added = max(0, after - before)
+        print(f"[autolike] {uid} -> +{added} likes (used {sent} tokens)")
+    except Exception as e:
+        print(f"[autolike] {uid} -> error: {e}")
+
+    now_iso = datetime.now().isoformat()
 
     with STATE["lock"]:
-        STATE["last_autolike"][uid] = datetime.now().isoformat()
+        STATE["last_autolike"][uid] = now_iso
+
+        if uid in STATE["autolike_jobs"]:
+            job = STATE["autolike_jobs"][uid]
+            job["runs"] = job.get("runs", 0) + 1
+            job["total_likes"] = job.get("total_likes", 0) + added
+            job["last_likes"] = added
+            job["last_run"] = now_iso
+
+        STATE["autolike_history"].setdefault(uid, []).append({
+            "timestamp": now_iso,
+            "likes_added": added,
+            "before": before,
+            "after": after,
+            "tokens_used": sent,
+            "accounts_total": len(jwts)
+        })
+
+        if uid in STATE["autolike_jobs"]:
+            if STATE["autolike_jobs"][uid].get("runs", 0) >= STATE["autolike_jobs"][uid].get("days", 0):
+                STATE["autolike_jobs"][uid]["finished"] = True
+
+    save_vip()
 
 
-def schedule_autolike(uid, dys):
+def schedule_autolike(uid, days):
     tag = "autolike_" + str(uid)
     schedule.clear(tag)
-    schedule.every().day.at(str(AUTOLIKE_HOUR).zfill(2) + ":00").do(
-        run_autolike_for, uid=uid, dys=dys
-    ).tag(tag)
+
+    now = datetime.now()
 
     with STATE["lock"]:
+        existing = STATE["autolike_jobs"].get(uid, {})
+        runs_done = existing.get("runs", 0) if existing.get("tag") == tag else 0
+        total_likes_done = existing.get("total_likes", 0) if existing.get("tag") == tag else 0
+        created = existing.get("created", now.isoformat()) if existing.get("tag") == tag else now.isoformat()
+
         STATE["autolike_jobs"][uid] = {
-            "dys": dys,
-            "created": datetime.now().isoformat(),
-            "tag": tag
+            "target_uid": uid,
+            "days": days,
+            "runs": runs_done,
+            "total_likes": total_likes_done,
+            "last_likes": existing.get("last_likes", 0),
+            "last_run": existing.get("last_run"),
+            "created": created,
+            "end_date": (now + timedelta(days=days)).isoformat(),
+            "tag": tag,
+            "finished": False,
+            "active": True
         }
+
+    def daily_job():
+        with STATE["lock"]:
+            job = STATE["autolike_jobs"].get(uid)
+            if not job:
+                return
+            runs = job.get("runs", 0)
+            if runs >= days:
+                schedule.clear(tag)
+                job["finished"] = True
+                job["active"] = False
+                print(f"[autolike] {uid} -> finished after {days} days")
+                return
+
+        print(f"[autolike] {uid} -> run {runs + 1}/{days}")
+        run_autolike_for(uid)
+
+    schedule.every().day.at(str(AUTOLIKE_HOUR).zfill(2) + ":00").do(daily_job).tag(tag)
+    print(f"[autolike] {uid} -> scheduled for {days} days at {AUTOLIKE_HOUR}:00")
+
+    save_vip()
+
+    threading.Thread(target=daily_job, daemon=True).start()
 
 
 def schedule_loop():
@@ -95,10 +190,14 @@ def index():
         "service": "FF Like API",
         "endpoints": [
             "GET /like?uid=123456677",
-            "GET /autolike?uid=3455565444&dys=30",
+            "GET /autolike?uid=3455565444&days=30",
             "POST /refresh",
             "GET /status",
-            "GET /accounts"
+            "GET /accounts",
+            "GET /targets",
+            "GET /viplog",
+            "GET /viplog?uid=18724269473",
+            "POST /viplog/delete?uid=18724269473"
         ]
     })
 
@@ -139,28 +238,28 @@ def api_like():
 @app.route("/autolike", methods=["GET"])
 def api_autolike():
     uid = request.args.get("uid", "").strip()
-    dys = request.args.get("dys", "30").strip()
+    days = request.args.get("days", "30").strip()
 
     if not uid.isdigit():
         return jsonify({"ok": False, "error": "uid must be numeric"}), 400
 
-    if not dys.isdigit() or int(dys) < 1:
-        return jsonify({"ok": False, "error": "dys must be positive int"}), 400
+    if not days.isdigit() or int(days) < 1:
+        return jsonify({"ok": False, "error": "days must be positive int"}), 400
 
-    dys = int(dys)
+    days = int(days)
 
-    schedule_autolike(uid, dys)
+    with STATE["lock"]:
+        working_count = len(STATE["working"])
 
-    threading.Thread(
-        target=run_autolike_for,
-        args=(uid, dys),
-        daemon=True
-    ).start()
+    schedule_autolike(uid, days)
 
     return jsonify({
         "uid": uid,
-        "dys": dys,
-        "schedule": "every day at 04:00",
+        "days": days,
+        "accounts_per_day": working_count,
+        "total_likes_expected": days * working_count,
+        "schedule": f"every day at {AUTOLIKE_HOUR}:00",
+        "saved_to": VIP_FILE,
         "status": "scheduled"
     })
 
@@ -183,13 +282,31 @@ def api_status():
         last_refresh = STATE["last_refresh"]
         last_autolike = dict(STATE["last_autolike"])
 
+    job_details = {}
+    for uid, job in jobs.items():
+        days = job.get("days", 0)
+        runs = job.get("runs", 0)
+        job_details[uid] = {
+            "days_total": days,
+            "runs_done": runs,
+            "days_remaining": max(0, days - runs),
+            "accounts_per_day": len(working),
+            "total_likes_expected": days * len(working),
+            "total_likes_done": job.get("total_likes", 0),
+            "last_likes": job.get("last_likes", 0),
+            "created": job.get("created"),
+            "end_date": job.get("end_date"),
+            "last_run": last_autolike.get(uid, "never"),
+            "active": job.get("active", False),
+            "finished": job.get("finished", False)
+        }
+
     return jsonify({
         "working_accounts": len(working),
         "last_refresh": last_refresh,
         "refresh_interval_hours": REFRESH_INTERVAL_HOURS,
         "autolike_hour": AUTOLIKE_HOUR,
-        "autolike_jobs": jobs,
-        "last_autolike": last_autolike
+        "autolike_jobs": job_details
     })
 
 
@@ -212,8 +329,234 @@ def api_accounts():
     })
 
 
+@app.route("/targets", methods=["GET"])
+def api_targets():
+    with STATE["lock"]:
+        jobs = dict(STATE["autolike_jobs"])
+        working = list(STATE["working"])
+
+    targets = []
+    for uid, job in jobs.items():
+        days = job.get("days", 0)
+        runs = job.get("runs", 0)
+        targets.append({
+            "target_uid": uid,
+            "days_total": days,
+            "runs_done": runs,
+            "days_remaining": max(0, days - runs),
+            "accounts_per_day": len(working),
+            "total_likes_expected": days * len(working),
+            "total_likes_done": job.get("total_likes", 0),
+            "created": job.get("created"),
+            "end_date": job.get("end_date"),
+            "active": job.get("active", False),
+            "finished": job.get("finished", False)
+        })
+
+    return jsonify({
+        "count": len(targets),
+        "targets": targets
+    })
+
+
+@app.route("/viplog", methods=["GET"])
+def api_viplog():
+    uid_filter = request.args.get("uid", "").strip()
+
+    with STATE["lock"]:
+        jobs = json.loads(json.dumps(STATE["autolike_jobs"]))
+        history = json.loads(json.dumps(STATE["autolike_history"]))
+        working = list(STATE["working"])
+
+    working_count = len(working)
+
+    now = datetime.now()
+
+    def build_entry(uid, job):
+        days = job.get("days", 0)
+        runs = job.get("runs", 0)
+        remaining_days = max(0, days - runs)
+        created_str = job.get("created")
+        end_date_str = job.get("end_date")
+
+        try:
+            created_dt = datetime.fromisoformat(created_str) if created_str else now
+        except Exception:
+            created_dt = now
+
+        try:
+            end_dt = datetime.fromisoformat(end_date_str) if end_date_str else now + timedelta(days=days)
+        except Exception:
+            end_dt = now + timedelta(days=days)
+
+        if job.get("finished"):
+            status = "finished"
+        elif job.get("active"):
+            status = "active"
+        else:
+            status = "inactive"
+
+        total_likes = job.get("total_likes", 0)
+        total_expected = days * working_count
+        started_days_ago = (now - created_dt).days
+
+        uid_history = history.get(uid, [])
+
+        return {
+            "target_uid": uid,
+            "status": status,
+            "started_at": created_str,
+            "started_days_ago": started_days_ago,
+            "end_date": end_date_str,
+            "days_total": days,
+            "days_completed": runs,
+            "days_remaining": remaining_days,
+            "accounts_per_day": working_count,
+            "total_likes_expected": total_expected,
+            "total_likes_added": total_likes,
+            "progress_percent": round((runs / days) * 100, 1) if days > 0 else 0,
+            "last_run": job.get("last_run"),
+            "last_likes_added": job.get("last_likes", 0),
+            "history_runs": len(uid_history),
+            "history": uid_history[-10:]
+        }
+
+    if uid_filter:
+        if not uid_filter.isdigit():
+            return jsonify({"ok": False, "error": "uid must be numeric"}), 400
+        if uid_filter not in jobs:
+            return jsonify({"ok": False, "error": "uid not found in autolike"}), 404
+        return jsonify(build_entry(uid_filter, jobs[uid_filter]))
+
+    all_entries = [build_entry(uid, job) for uid, job in jobs.items()]
+    all_entries.sort(key=lambda x: x.get("started_at") or "", reverse=True)
+
+    active = [e for e in all_entries if e["status"] == "active"]
+    finished = [e for e in all_entries if e["status"] == "finished"]
+
+    return jsonify({
+        "vip_file": VIP_FILE,
+        "total_targets": len(all_entries),
+        "active_count": len(active),
+        "finished_count": len(finished),
+        "working_accounts": working_count,
+        "now": now.isoformat(),
+        "targets": all_entries
+    })
+
+
+@app.route("/viplog/delete", methods=["POST", "GET"])
+def api_viplog_delete():
+    uid = request.args.get("uid", "").strip()
+
+    if not uid.isdigit():
+        return jsonify({"ok": False, "error": "uid must be numeric"}), 400
+
+    with STATE["lock"]:
+        if uid in STATE["autolike_jobs"]:
+            removed = STATE["autolike_jobs"].pop(uid)
+            STATE["autolike_history"].pop(uid, None)
+            STATE["last_autolike"].pop(uid, None)
+            schedule.clear("autolike_" + str(uid))
+            ok = True
+        else:
+            removed = None
+            ok = False
+
+    save_vip()
+
+    return jsonify({
+        "ok": ok,
+        "uid": uid,
+        "removed": removed
+    })
+
+
+@app.route("/viplog/history", methods=["GET"])
+def api_viplog_history():
+    uid = request.args.get("uid", "").strip()
+
+    with STATE["lock"]:
+        history = json.loads(json.dumps(STATE["autolike_history"]))
+
+    if uid:
+        if not uid.isdigit():
+            return jsonify({"ok": False, "error": "uid must be numeric"}), 400
+        return jsonify({
+            "uid": uid,
+            "history": history.get(uid, [])
+        })
+
+    return jsonify({
+        "count": len(history),
+        "history": history
+    })
+
+
+def restore_from_vip():
+    data = load_vip()
+    if not data:
+        print("[vip] no saved jobs to restore")
+        return
+
+    print(f"[vip] restoring {len(data)} jobs from {VIP_FILE}")
+
+    for uid, job in data.items():
+        try:
+            days = job.get("days", 0)
+            runs = job.get("runs", 0)
+            remaining = days - runs
+
+            if remaining <= 0 or job.get("finished"):
+                with STATE["lock"]:
+                    STATE["autolike_jobs"][uid] = job
+                    STATE["autolike_jobs"][uid]["finished"] = True
+                    STATE["autolike_jobs"][uid]["active"] = False
+                print(f"[vip] {uid} already finished ({runs}/{days})")
+                continue
+
+            if not uid.isdigit():
+                continue
+
+            tag = "autolike_" + str(uid)
+            schedule.clear(tag)
+
+            with STATE["lock"]:
+                STATE["autolike_jobs"][uid] = job
+                STATE["autolike_jobs"][uid]["active"] = True
+                STATE["autolike_jobs"][uid]["finished"] = False
+
+            def make_daily_job(target_uid, total_days, job_tag):
+                def daily_job():
+                    with STATE["lock"]:
+                        j = STATE["autolike_jobs"].get(target_uid)
+                        if not j:
+                            return
+                        r = j.get("runs", 0)
+                        if r >= total_days:
+                            schedule.clear(job_tag)
+                            j["finished"] = True
+                            j["active"] = False
+                            print(f"[autolike] {target_uid} -> finished")
+                            save_vip()
+                            return
+                    print(f"[autolike] {target_uid} -> run {r + 1}/{total_days}")
+                    run_autolike_for(target_uid)
+                return daily_job
+
+            schedule.every().day.at(str(AUTOLIKE_HOUR).zfill(2) + ":00").do(
+                make_daily_job(uid, days, tag)
+            ).tag(tag)
+
+            print(f"[vip] {uid} restored ({runs}/{days} done, {remaining} days left)")
+
+        except Exception as e:
+            print(f"[vip] restore error for {uid}: {e}")
+
+
 def start_background_threads():
     refresh_all_accounts()
+    restore_from_vip()
 
     t1 = threading.Thread(target=job_refresh_loop, daemon=True)
     t1.start()
@@ -222,6 +565,7 @@ def start_background_threads():
     t2.start()
 
     print("[start] background threads ready")
+    print(f"[start] vip file: {VIP_FILE}")
 
 
 if __name__ == "__main__":
